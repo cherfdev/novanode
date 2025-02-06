@@ -2,8 +2,20 @@ const axios = require('axios'); // Импортируем Axios для HTTP за
 const fs = require('fs'); // Импортируем fs для работы с файловой системой
 const readline = require('readline'); // Импортируем readline для ввода данных с клавиатуры
 
+
+const colorCodes = {
+    success: (msg) => `\x1b[32m${msg}\x1b[0m`,
+    error: (msg) => `\x1b[31m${msg}\x1b[0m`,
+    warn: (msg) => `\x1b[33m${msg}\x1b[0m`
+};
+
+
+const MAX_RETRIES = 3;
+
+const failedLinks = []; // Список ссылок, которые не удалось обработать
+
 // Функция для обработки одной ссылки
-async function processLink(link) {
+async function processLink(link, attempt = 1) {
     try {
         // Извлечение ID и имени файла из ссылки
         const urlParts = link.split('/');
@@ -20,7 +32,7 @@ async function processLink(link) {
             method_free: 'Free Download >>'
         };
 
-        console.log(`Начинается обработка ссылки: ${link}`);
+        console.log(`(${attempt}) Начинается обработка ссылки: ${link}`);
 
         // Первый POST запрос
         const firstResponse = await axios.post('https://datanodes.to/download', new URLSearchParams(firstPostData), {
@@ -58,17 +70,29 @@ async function processLink(link) {
         });
 
         // Извлекаем URL перенаправления из заголовка 'Location'
-        const redirectUrl = secondResponse['data'];
+        const redirectUrl = secondResponse.data;
 
-        if (!redirectUrl) {
+        if (!redirectUrl || !redirectUrl.url) {
+
             throw new Error('Не удалось найти URL перенаправления в ответе.');
+
         }
 
-        console.log(`Обработка ссылки завершена: ${link}`);
-        return redirectUrl.url // Возвращаем URL перенаправления
+        console.log(colorCodes.success(`Обработка ссылки завершена: ${link}`));
+        return redirectUrl.url
     } catch (error) {
-        console.error(`Ошибка при обработке ссылки ${link}:`, error.message);
-        return null; // В случае ошибки возвращаем null
+
+        console.error(colorCodes.error(`Ошибка при обработке ссылки ${link} (попытка ${attempt}): ${error.message}`));
+
+        if (attempt < MAX_RETRIES) {
+            console.log(colorCodes.warn(`Повторная попытка (${attempt + 1}) для ссылки: ${link}`));
+            return processLink(link, attempt + 1);
+        } else {
+            console.error(`Не удалось обработать ссылку после ${MAX_RETRIES} попыток: ${link}`);
+            failedLinks.push(link);
+            return null;
+
+        }
     }
 }
 
@@ -79,7 +103,10 @@ async function processLinks(links) {
     console.log(`Начало обработки ${links.length} ссылок...`);
 
     // Обрабатываем каждую ссылку
-    for (const link of links) {
+    console.log(`Начало обработки ${links.length} ссылок...`);
+
+    for (const [index, link] of links.entries()) {
+        console.log(`Обрабатывается ссылка ${index + 1} из ${links.length}: ${link}`);
         const result = await processLink(link);
         if (result) {
             results.push(result);
@@ -88,7 +115,11 @@ async function processLinks(links) {
 
     // Сохраняем результаты в файл
     fs.writeFileSync('results.txt', results.join('\n'), 'utf-8');
-    console.log('Ссылки перенаправления сохранены в файл results.txt');
+    console.log(colorCodes.success('Ссылки перенаправления сохранены в файл results.txt'));
+    if (failedLinks.length > 0) {
+        console.log('Не удалось обработать следующие ссылки:');
+        failedLinks.forEach(link => console.log(link));
+    }
     console.log('Обработка всех ссылок завершена.');
 }
 
