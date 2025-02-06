@@ -9,7 +9,7 @@ async function processLink(link) {
         const urlParts = link.split('/');
         const fileId = urlParts[3];
         const fileName = urlParts[4];
-        
+
         // Данные для первого POST запроса
         const firstPostData = {
             op: 'download1',
@@ -25,7 +25,8 @@ async function processLink(link) {
         // Первый POST запрос
         const firstResponse = await axios.post('https://datanodes.to/download', new URLSearchParams(firstPostData), {
             headers: {
-                'Content-Type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
             }
         });
 
@@ -42,7 +43,7 @@ async function processLink(link) {
             referer: 'https://datanodes.to/download',
             method_free: 'Free Download >>',
             method_premium: '',
-            adblock_detected: ''
+            dl: 1
         };
 
         // Второй POST запрос
@@ -52,19 +53,19 @@ async function processLink(link) {
             },
             maxRedirects: 0, // Чтобы поймать редирект без его выполнения
             validateStatus: function (status) {
-                return status === 302; // Принимаем только статус 302
+                return status === 200; // Принимаем только статус 200
             }
         });
 
         // Извлекаем URL перенаправления из заголовка 'Location'
-        const redirectUrl = secondResponse.headers.location;
+        const redirectUrl = secondResponse['data'];
 
         if (!redirectUrl) {
             throw new Error('Не удалось найти URL перенаправления в ответе.');
         }
 
         console.log(`Обработка ссылки завершена: ${link}`);
-        return redirectUrl; // Возвращаем URL перенаправления
+        return redirectUrl.url // Возвращаем URL перенаправления
     } catch (error) {
         console.error(`Ошибка при обработке ссылки ${link}:`, error.message);
         return null; // В случае ошибки возвращаем null
