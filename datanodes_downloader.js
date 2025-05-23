@@ -109,7 +109,8 @@ async function processLinks(links) {
         console.log(`Обрабатывается ссылка ${index + 1} из ${links.length}: ${link}`);
         const result = await processLink(link);
         if (result) {
-            results.push(result);
+			result_ = decodeURIComponent(result);
+            results.push(result_.replace(/[\r\n\t]/g, '').trim());
         }
     }
 
