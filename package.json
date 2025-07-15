@@ -1,0 +1,23 @@
+{
+  "name": "dn-direct-link-downloader",
+  "version": "1.0.0",
+  "description": "**DataNodes Downloader** is a utility for bulk downloading files from the DataNodes site using POST requests to obtain download links. The program accepts links from the user, processes them sequentially, and saves the redirect URLs to a text file named `results.txt`.",
+  "main": "datanodes_downloader.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EgoPros/DN-direct-link-downloader.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/EgoPros/DN-direct-link-downloader/issues"
+  },
+  "homepage": "https://github.com/EgoPros/DN-direct-link-downloader#readme",
+  "dependencies": {
+    "axios": "^1.9.0"
+  }
+}
