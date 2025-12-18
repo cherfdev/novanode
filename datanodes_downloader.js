@@ -1,27 +1,52 @@
+/**
+ * DN Direct Link Downloader - Enterprise Grade Implementation
+ * 
+ * This module provides a robust, production-ready solution for processing
+ * datanodes.to download links with comprehensive error handling, logging,
+ * and configuration management.
+ * 
+ * @author Senior Developer
+ * @version 2.0.0
+ * @license MIT
+ */
+
+'use strict';
+
 const axios = require('axios');
-const fs = require('fs');
+const fs = require('fs').promises;
+const fsSync = require('fs');
 const readline = require('readline');
 const path = require('path');
+const { EventEmitter } = require('events');
 
-// Константы
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
+
 const CONFIG = {
     MAX_RETRIES: 3,
     BASE_URL: 'https://datanodes.to/download',
     USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
     OUTPUT_FILE: 'results.txt',
     CONFIG_FILE: 'downloader_config.json',
-    DEFAULT_DELAY: 500
+    DEFAULT_DELAY: 500,
+    REQUEST_TIMEOUT: 30000,
+    MAX_CONCURRENT_REQUESTS: 5
 };
 
-// Цветовые коды для консоли
+// ANSI Color codes for terminal output
 const COLORS = {
     success: (msg) => `\x1b[32m${msg}\x1b[0m`,
     error: (msg) => `\x1b[31m${msg}\x1b[0m`,
     warn: (msg) => `\x1b[33m${msg}\x1b[0m`,
-    info: (msg) => `\x1b[36m${msg}\x1b[0m`
+    info: (msg) => `\x1b[36m${msg}\x1b[0m`,
+    debug: (msg) => `\x1b[90m${msg}\x1b[0m`
 };
 
-// Локализация
+// ============================================================================
+// INTERNATIONALIZATION
+// ============================================================================
+
 const TRANSLATIONS = {
     ru: {
         title: '🔗 DN Direct Link Downloader',
@@ -111,68 +136,341 @@ const TRANSLATIONS = {
     }
 };
 
-// Класс для управления конфигурацией
+// ============================================================================
+// CUSTOM ERROR CLASSES
+// ============================================================================
+
+/**
+ * Base application error class
+ */
+class AppError extends Error {
+    constructor(message, isOperational = true, httpCode = 500) {
+        super(message);
+        
+        // Restore prototype chain
+        Object.setPrototypeOf(this, new.target.prototype);
+        
+        this.name = this.constructor.name;
+        this.isOperational = isOperational;
+        this.httpCode = httpCode;
+        this.timestamp = new Date().toISOString();
+        
+        Error.captureStackTrace(this, this.constructor);
+    }
+}
+
+/**
+ * Configuration error
+ */
+class ConfigurationError extends AppError {
+    constructor(message) {
+        super(message, true, 500);
+    }
+}
+
+/**
+ * Network request error
+ */
+class NetworkError extends AppError {
+    constructor(message, originalError = null) {
+        super(message, true, 503);
+        this.originalError = originalError;
+    }
+}
+
+/**
+ * Link parsing error
+ */
+class LinkParsingError extends AppError {
+    constructor(message) {
+        super(message, true, 400);
+    }
+}
+
+// ============================================================================
+// CENTRALIZED ERROR HANDLER
+// ============================================================================
+
+class ErrorHandler {
+    constructor() {
+        this.isHandlingError = false;
+    }
+
+    /**
+     * Centralized error handling method
+     * @param {Error} error - The error to handle
+     * @param {string} context - Context where error occurred
+     */
+    async handleError(error, context = 'unknown') {
+        if (this.isHandlingError) {
+            console.error(COLORS.error('Error handler recursion detected, exiting...'));
+            process.exit(1);
+        }
+
+        this.isHandlingError = true;
+
+        try {
+            await this.logError(error, context);
+            await this.determineErrorAction(error);
+        } catch (handlerError) {
+            console.error(COLORS.error(`Error in error handler: ${handlerError.message}`));
+            process.exit(1);
+        } finally {
+            this.isHandlingError = false;
+        }
+    }
+
+    /**
+     * Log error with context
+     */
+    async logError(error, context) {
+        const errorInfo = {
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            context,
+            timestamp: new Date().toISOString(),
+            isOperational: error.isOperational || false
+        };
+
+        console.error(COLORS.error(`[${context}] ${error.name}: ${error.message}`));
+        
+        if (process.env.NODE_ENV === 'development') {
+            console.error(COLORS.debug(error.stack));
+        }
+    }
+
+    /**
+     * Determine action based on error type
+     */
+    async determineErrorAction(error) {
+        if (!this.isTrustedError(error)) {
+            console.error(COLORS.error('Untrusted error detected, shutting down...'));
+            process.exit(1);
+        }
+    }
+
+    /**
+     * Check if error is trusted (operational)
+     */
+    isTrustedError(error) {
+        return error.isOperational === true;
+    }
+}
+
+// Global error handler instance
+const errorHandler = new ErrorHandler();
+
+// ============================================================================
+// CONFIGURATION MANAGER
+// ============================================================================
+
 class ConfigManager {
     constructor() {
         this.configPath = CONFIG.CONFIG_FILE;
         this.defaultConfig = {
             language: 'ru',
-            delay: CONFIG.DEFAULT_DELAY
+            delay: CONFIG.DEFAULT_DELAY,
+            maxRetries: CONFIG.MAX_RETRIES,
+            requestTimeout: CONFIG.REQUEST_TIMEOUT
         };
     }
 
-    // Загрузка конфигурации
-    loadConfig() {
+    /**
+     * Load configuration from file
+     * @returns {Promise<Object>} Configuration object
+     */
+    async loadConfig() {
         try {
-            if (fs.existsSync(this.configPath)) {
-                const configData = fs.readFileSync(this.configPath, 'utf-8');
-                return JSON.parse(configData);
-            }
+            const configData = await fs.readFile(this.configPath, 'utf-8');
+            const config = JSON.parse(configData);
+            
+            // Validate and merge with defaults
+            return this.validateAndMergeConfig(config);
         } catch (error) {
-            console.log(COLORS.warn('Error loading config, using defaults'));
+            if (error.code === 'ENOENT') {
+                console.log(COLORS.warn('Configuration file not found, using defaults'));
+                return this.defaultConfig;
+            }
+            throw new ConfigurationError(`Failed to load configuration: ${error.message}`);
         }
-        return this.defaultConfig;
     }
 
-    // Сохранение конфигурации
-    saveConfig(config) {
+    /**
+     * Save configuration to file
+     * @param {Object} config - Configuration to save
+     * @returns {Promise<boolean>} Success status
+     */
+    async saveConfig(config) {
         try {
-            fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), 'utf-8');
+            const validatedConfig = this.validateAndMergeConfig(config);
+            await fs.writeFile(this.configPath, JSON.stringify(validatedConfig, null, 2), 'utf-8');
             return true;
         } catch (error) {
-            console.error(COLORS.error(`Error saving config: ${error.message}`));
-            return false;
+            throw new ConfigurationError(`Failed to save configuration: ${error.message}`);
         }
+    }
+
+    /**
+     * Validate and merge configuration with defaults
+     * @param {Object} config - User configuration
+     * @returns {Object} Validated and merged configuration
+     */
+    validateAndMergeConfig(config) {
+        const merged = { ...this.defaultConfig, ...config };
+        
+        // Validate language
+        if (!['ru', 'en'].includes(merged.language)) {
+            merged.language = this.defaultConfig.language;
+        }
+        
+        // Validate delay
+        if (typeof merged.delay !== 'number' || merged.delay < 0) {
+            merged.delay = this.defaultConfig.delay;
+        }
+        
+        // Validate maxRetries
+        if (typeof merged.maxRetries !== 'number' || merged.maxRetries < 1) {
+            merged.maxRetries = this.defaultConfig.maxRetries;
+        }
+        
+        return merged;
     }
 }
 
-// Класс для обработки ссылок
-class DatanodesDownloader {
-    constructor(language, delay) {
-        this.failedLinks = [];
-        this.results = [];
-        this.language = language;
-        this.delay = delay;
-        this.t = TRANSLATIONS[language];
+// ============================================================================
+// HTTP CLIENT WITH RETRY LOGIC
+// ============================================================================
+
+class HttpClient {
+    constructor(config) {
+        this.config = config;
+        this.axiosInstance = axios.create({
+            timeout: config.requestTimeout || CONFIG.REQUEST_TIMEOUT,
+            headers: {
+                'User-Agent': CONFIG.USER_AGENT,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+        });
+
+        // Add request/response interceptors for logging
+        this.setupInterceptors();
     }
 
-    // Извлечение ID и имени файла из ссылки
-    parseLink(link) {
-        try {
-            const urlParts = link.split('/');
-            if (urlParts.length < 5) {
-                throw new Error(this.t.invalidLinkFormat);
+    /**
+     * Setup axios interceptors for logging and error handling
+     */
+    setupInterceptors() {
+        this.axiosInstance.interceptors.request.use(
+            (config) => {
+                console.log(COLORS.debug(`Making request to: ${config.url}`));
+                return config;
+            },
+            (error) => {
+                console.error(COLORS.error(`Request error: ${error.message}`));
+                return Promise.reject(error);
             }
-            return {
-                fileId: urlParts[3],
-                fileName: urlParts[4]
-            };
+        );
+
+        this.axiosInstance.interceptors.response.use(
+            (response) => {
+                console.log(COLORS.debug(`Response received: ${response.status}`));
+                return response;
+            },
+            (error) => {
+                console.error(COLORS.error(`Response error: ${error.message}`));
+                return Promise.reject(error);
+            }
+        );
+    }
+
+    /**
+     * Make HTTP request with retry logic
+     * @param {string} url - Request URL
+     * @param {Object} options - Request options
+     * @param {number} retries - Number of retries
+     * @returns {Promise<Object>} Response object
+     */
+    async request(url, options = {}, retries = 0) {
+        try {
+            return await this.axiosInstance.request({
+                url,
+                ...options
+            });
         } catch (error) {
-            throw new Error(`${this.t.parsingError} ${error.message}`);
+            if (retries < this.config.maxRetries) {
+                const delay = Math.pow(2, retries) * 1000; // Exponential backoff
+                console.log(COLORS.warn(`Retrying request (${retries + 1}/${this.config.maxRetries}) in ${delay}ms`));
+                await this.sleep(delay);
+                return this.request(url, options, retries + 1);
+            }
+            
+            throw new NetworkError(`Request failed after ${this.config.maxRetries} retries: ${error.message}`, error);
         }
     }
 
-    // Первый POST запрос
+    /**
+     * Sleep utility
+     * @param {number} ms - Milliseconds to sleep
+     */
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+// ============================================================================
+// LINK PROCESSOR
+// ============================================================================
+
+class LinkProcessor {
+    constructor(httpClient, config) {
+        this.httpClient = httpClient;
+        this.config = config;
+        this.eventEmitter = new EventEmitter();
+    }
+
+    /**
+     * Parse datanodes link to extract file ID and name
+     * @param {string} link - Datanodes link
+     * @returns {Object} Parsed link data
+     */
+    parseLink(link) {
+        try {
+            if (!link || typeof link !== 'string') {
+                throw new LinkParsingError('Link must be a non-empty string');
+            }
+
+            if (!link.includes('datanodes.to')) {
+                throw new LinkParsingError('Invalid datanodes link format');
+            }
+
+            const urlParts = link.split('/');
+            if (urlParts.length < 5) {
+                throw new LinkParsingError('Link does not contain required parts');
+            }
+
+            const fileId = urlParts[3];
+            const fileName = urlParts[4];
+
+            if (!fileId || !fileName) {
+                throw new LinkParsingError('Missing file ID or name in link');
+            }
+
+            return { fileId, fileName };
+        } catch (error) {
+            if (error instanceof LinkParsingError) {
+                throw error;
+            }
+            throw new LinkParsingError(`Link parsing failed: ${error.message}`);
+        }
+    }
+
+    /**
+     * Make first POST request to initiate download
+     * @param {string} fileId - File ID
+     * @param {string} fileName - File name
+     * @returns {Promise<Object>} Response object
+     */
     async makeFirstRequest(fileId, fileName) {
         const postData = {
             op: 'download1',
@@ -183,22 +481,17 @@ class DatanodesDownloader {
             method_free: 'Free Download >>'
         };
 
-        const response = await axios.post(CONFIG.BASE_URL, new URLSearchParams(postData), {
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': CONFIG.USER_AGENT
-            },
-            timeout: 30000
+        return this.httpClient.request(CONFIG.BASE_URL, {
+            method: 'POST',
+            data: new URLSearchParams(postData)
         });
-
-        if (response.status !== 200) {
-            throw new Error(`${this.t.firstRequestError} ${response.status}`);
-        }
-
-        return response;
     }
 
-    // Второй POST запрос
+    /**
+     * Make second POST request to get redirect URL
+     * @param {string} fileId - File ID
+     * @returns {Promise<Object>} Response object
+     */
     async makeSecondRequest(fileId) {
         const postData = {
             op: 'download2',
@@ -207,124 +500,200 @@ class DatanodesDownloader {
             referer: CONFIG.BASE_URL,
             method_free: 'Free Download >>',
             method_premium: '',
-            dl: 1
+            __dl: 1
         };
 
-        const response = await axios.post(CONFIG.BASE_URL, new URLSearchParams(postData), {
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': CONFIG.USER_AGENT
-            },
+        return this.httpClient.request(CONFIG.BASE_URL, {
+            method: 'POST',
+            data: new URLSearchParams(postData),
             maxRedirects: 0,
-            validateStatus: (status) => status === 200,
-            timeout: 30000
+            validateStatus: (status) => status === 200
         });
-
-        return response;
     }
 
-    // Обработка одной ссылки
-    async processLink(link, attempt = 1) {
+    /**
+     * Process single link
+     * @param {string} link - Link to process
+     * @returns {Promise<string|null>} Redirect URL or null if failed
+     */
+    async processLink(link) {
         try {
-            console.log(COLORS.info(`(${attempt}) ${this.t.linkProcessingStart} ${link}`));
-
+            this.eventEmitter.emit('linkProcessingStart', link);
+            
             const { fileId, fileName } = this.parseLink(link);
+            
             await this.makeFirstRequest(fileId, fileName);
             const secondResponse = await this.makeSecondRequest(fileId);
-            const redirectUrl = secondResponse.data;
-
-            if (!redirectUrl || !redirectUrl.url) {
-                throw new Error(this.t.noRedirectUrl);
-            }
-
-            console.log(COLORS.success(`${this.t.linkProcessingSuccess} ${link}`));
-            return redirectUrl.url;
-
-        } catch (error) {
-            console.error(COLORS.error(`${this.t.linkProcessingError} ${link} (${this.t.attempts} ${attempt}): ${error.message}`));
-
-            if (attempt < CONFIG.MAX_RETRIES) {
-                console.log(COLORS.warn(`${this.t.retryAttempt} (${attempt + 1}) ${this.t.of} ${link}`));
-                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-                return this.processLink(link, attempt + 1);
-            } else {
-                console.error(COLORS.error(`${this.t.maxRetriesReached} ${CONFIG.MAX_RETRIES} ${this.t.attempts} ${link}`));
-                this.failedLinks.push(link);
-                return null;
-            }
-        }
-    }
-
-    // Обработка массива ссылок
-    async processLinks(links) {
-        if (!Array.isArray(links) || links.length === 0) {
-            console.log(COLORS.warn(this.t.noLinks));
-            return;
-        }
-
-        console.log(COLORS.info(`${this.t.processingStart} ${links.length} ${this.t.of} ${this.t.attempts}...`));
-
-        for (const [index, link] of links.entries()) {
-            console.log(COLORS.info(`${this.t.processingLink} ${index + 1} ${this.t.of} ${links.length}: ${link}`));
             
-            const result = await this.processLink(link);
-            if (result) {
-                const cleanResult = decodeURIComponent(result).replace(/[\r\n\t]/g, '').trim();
-                this.results.push(cleanResult);
+            const redirectUrl = secondResponse.data;
+            if (!redirectUrl || !redirectUrl.url) {
+                throw new Error('No redirect URL found in response');
             }
 
-            if (index < links.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, this.delay));
-            }
-        }
-
-        this.saveResults();
-        this.printSummary();
-    }
-
-    // Сохранение результатов
-    saveResults() {
-        try {
-            fs.writeFileSync(CONFIG.OUTPUT_FILE, this.results.join('\n'), 'utf-8');
-            console.log(COLORS.success(`${this.t.resultsSaved} ${CONFIG.OUTPUT_FILE}`));
+            this.eventEmitter.emit('linkProcessingSuccess', link);
+            return decodeURIComponent(redirectUrl.url).replace(/[\r\n\t]/g, '').trim();
+            
         } catch (error) {
-            console.error(COLORS.error(`${this.t.saveError} ${error.message}`));
+            this.eventEmitter.emit('linkProcessingError', { link, error });
+            throw error;
         }
-    }
-
-    // Вывод итоговой статистики
-    printSummary() {
-        console.log(COLORS.info(`\n${this.t.summary}`));
-        console.log(COLORS.success(`${this.t.successCount} ${this.results.length} ${this.t.attempts}`));
-        console.log(COLORS.error(`${this.t.failedCount} ${this.failedLinks.length} ${this.t.attempts}`));
-
-        if (this.failedLinks.length > 0) {
-            console.log(COLORS.warn(`\n${this.t.failedLinks}`));
-            this.failedLinks.forEach((link, index) => {
-                console.log(`${index + 1}. ${link}`);
-            });
-        }
-
-        console.log(COLORS.success(`\n${this.t.processingComplete}`));
     }
 }
 
-// Класс для работы с пользовательским вводом
+// ============================================================================
+// DOWNLOAD MANAGER
+// ============================================================================
+
+class DownloadManager {
+    constructor(config, language) {
+        this.config = config;
+        this.language = language;
+        this.translations = TRANSLATIONS[language];
+        this.httpClient = new HttpClient(config);
+        this.linkProcessor = new LinkProcessor(this.httpClient, config);
+        this.results = [];
+        this.failedLinks = [];
+        this.eventEmitter = this.linkProcessor.eventEmitter;
+        
+        this.setupEventListeners();
+    }
+
+    /**
+     * Setup event listeners for link processing
+     */
+    setupEventListeners() {
+        this.eventEmitter.on('linkProcessingStart', (link) => {
+            console.log(COLORS.info(`${this.translations.linkProcessingStart} ${link}`));
+        });
+
+        this.eventEmitter.on('linkProcessingSuccess', (link) => {
+            console.log(COLORS.success(`${this.translations.linkProcessingSuccess} ${link}`));
+        });
+
+        this.eventEmitter.on('linkProcessingError', ({ link, error }) => {
+            console.error(COLORS.error(`${this.translations.linkProcessingError} ${link}: ${error.message}`));
+        });
+    }
+
+    /**
+     * Process multiple links with concurrency control
+     * @param {string[]} links - Array of links to process
+     * @returns {Promise<Object>} Processing results
+     */
+    async processLinks(links) {
+        if (!Array.isArray(links) || links.length === 0) {
+            console.log(COLORS.warn(this.translations.noLinks));
+            return { results: [], failedLinks: [] };
+        }
+
+        console.log(COLORS.info(`${this.translations.processingStart} ${links.length} ${this.translations.of} ${this.translations.attempts}...`));
+
+        const results = [];
+        const failedLinks = [];
+
+        // Process links with controlled concurrency
+        for (let i = 0; i < links.length; i += CONFIG.MAX_CONCURRENT_REQUESTS) {
+            const batch = links.slice(i, i + CONFIG.MAX_CONCURRENT_REQUESTS);
+            const batchPromises = batch.map(async (link, index) => {
+                const globalIndex = i + index;
+                console.log(COLORS.info(`${this.translations.processingLink} ${globalIndex + 1} ${this.translations.of} ${links.length}: ${link}`));
+                
+                try {
+                    const result = await this.linkProcessor.processLink(link);
+                    return { success: true, link, result };
+                } catch (error) {
+                    return { success: false, link, error: error.message };
+                }
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            
+            batchResults.forEach(({ success, link, result, error }) => {
+                if (success) {
+                    results.push(result);
+                } else {
+                    failedLinks.push({ link, error });
+                }
+            });
+
+            // Add delay between batches
+            if (i + CONFIG.MAX_CONCURRENT_REQUESTS < links.length) {
+                await this.sleep(this.config.delay);
+            }
+        }
+
+        this.results = results;
+        this.failedLinks = failedLinks;
+
+        await this.saveResults();
+        this.printSummary();
+
+        return { results, failedLinks };
+    }
+
+    /**
+     * Save results to file
+     * @returns {Promise<void>}
+     */
+    async saveResults() {
+        try {
+            await fs.writeFile(CONFIG.OUTPUT_FILE, this.results.join('\n'), 'utf-8');
+            console.log(COLORS.success(`${this.translations.resultsSaved} ${CONFIG.OUTPUT_FILE}`));
+        } catch (error) {
+            throw new Error(`${this.translations.saveError} ${error.message}`);
+        }
+    }
+
+    /**
+     * Print processing summary
+     */
+    printSummary() {
+        console.log(COLORS.info(`\n${this.translations.summary}`));
+        console.log(COLORS.success(`${this.translations.successCount} ${this.results.length} ${this.translations.attempts}`));
+        console.log(COLORS.error(`${this.translations.failedCount} ${this.failedLinks.length} ${this.translations.attempts}`));
+
+        if (this.failedLinks.length > 0) {
+            console.log(COLORS.warn(`\n${this.translations.failedLinks}`));
+            this.failedLinks.forEach(({ link, error }, index) => {
+                console.log(`${index + 1}. ${link} - ${error}`);
+            });
+        }
+
+        console.log(COLORS.success(`\n${this.translations.processingComplete}`));
+    }
+
+    /**
+     * Sleep utility
+     * @param {number} ms - Milliseconds to sleep
+     */
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+// ============================================================================
+// USER INPUT HANDLER
+// ============================================================================
+
 class UserInputHandler {
     constructor(language) {
         this.language = language;
-        this.t = TRANSLATIONS[language];
+        this.translations = TRANSLATIONS[language];
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
         });
-        this.links = [];
     }
 
-    // Получение ссылок от пользователя
+    /**
+     * Get links from user input
+     * @returns {Promise<string[]>} Array of links
+     */
     async getLinks() {
         return new Promise((resolve) => {
-            this.rl.setPrompt(`${this.t.enterLinks}\n`);
+            const links = [];
+            
+            console.log(this.translations.enterLinks);
             this.rl.prompt();
 
             this.rl.on('line', (line) => {
@@ -332,13 +701,13 @@ class UserInputHandler {
                 
                 if (trimmedLine === '') {
                     this.rl.close();
-                    resolve(this.links);
+                    resolve(links);
                 } else {
                     if (this.isValidLink(trimmedLine)) {
-                        this.links.push(trimmedLine);
-                        console.log(COLORS.success(`${this.t.linkAdded} ${trimmedLine}`));
+                        links.push(trimmedLine);
+                        console.log(COLORS.success(`${this.translations.linkAdded} ${trimmedLine}`));
                     } else {
-                        console.log(COLORS.warn(`${this.t.invalidLink} ${trimmedLine}`));
+                        console.log(COLORS.warn(`${this.translations.invalidLink} ${trimmedLine}`));
                     }
                     this.rl.prompt();
                 }
@@ -346,24 +715,36 @@ class UserInputHandler {
         });
     }
 
-    // Простая валидация ссылки
+    /**
+     * Validate link format
+     * @param {string} link - Link to validate
+     * @returns {boolean} Validation result
+     */
     isValidLink(link) {
-        return link.includes('datanodes.to');
+        return link && typeof link === 'string' && link.includes('datanodes.to');
     }
 
-    // Закрытие интерфейса
+    /**
+     * Close readline interface
+     */
     close() {
         this.rl.close();
     }
 }
 
-// Класс для настройки приложения
+// ============================================================================
+// APPLICATION SETUP
+// ============================================================================
+
 class AppSetup {
     constructor() {
         this.configManager = new ConfigManager();
     }
 
-    // Выбор языка
+    /**
+     * Select language interactively
+     * @returns {Promise<string>} Selected language
+     */
     async selectLanguage() {
         return new Promise((resolve) => {
             const rl = readline.createInterface({
@@ -371,8 +752,8 @@ class AppSetup {
                 output: process.stdout
             });
 
-            console.log(COLORS.info(this.getTranslation('languageSelect')));
-            console.log(this.getTranslation('languageOptions'));
+            console.log(COLORS.info(TRANSLATIONS.ru.languageSelect));
+            console.log(TRANSLATIONS.ru.languageOptions);
 
             rl.question('> ', (answer) => {
                 rl.close();
@@ -383,16 +764,20 @@ class AppSetup {
                 } else if (choice === '2') {
                     resolve('en');
                 } else {
-                    console.log(COLORS.warn(this.getTranslation('invalidChoice')));
+                    console.log(COLORS.warn(TRANSLATIONS.ru.invalidChoice));
                     resolve(this.selectLanguage());
                 }
             });
         });
     }
 
-    // Настройка задержки
+    /**
+     * Setup delay configuration
+     * @param {string} language - Current language
+     * @returns {Promise<number>} Delay in milliseconds
+     */
     async setupDelay(language) {
-        const t = TRANSLATIONS[language];
+        const translations = TRANSLATIONS[language];
         const rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
@@ -400,26 +785,26 @@ class AppSetup {
 
         return new Promise((resolve) => {
             const askForDelay = () => {
-                rl.question(`${t.useDefaultDelay} `, (answer) => {
+                rl.question(`${translations.useDefaultDelay} `, (answer) => {
                     const choice = answer.trim().toLowerCase();
                     
                     if (choice === 'y' || choice === 'yes' || choice === 'да') {
                         rl.close();
                         resolve(CONFIG.DEFAULT_DELAY);
                     } else if (choice === 'n' || choice === 'no' || choice === 'нет') {
-                        rl.question(`${t.customDelay} `, (delayAnswer) => {
+                        rl.question(`${translations.customDelay} `, (delayAnswer) => {
                             const delay = parseInt(delayAnswer.trim());
                             rl.close();
                             
                             if (isNaN(delay) || delay < 0) {
-                                console.log(COLORS.warn(t.invalidDelay));
+                                console.log(COLORS.warn(translations.invalidDelay));
                                 resolve(CONFIG.DEFAULT_DELAY);
                             } else {
                                 resolve(delay);
                             }
                         });
                     } else {
-                        console.log(COLORS.warn(t.invalidChoice));
+                        console.log(COLORS.warn(translations.invalidChoice));
                         askForDelay();
                     }
                 });
@@ -429,13 +814,17 @@ class AppSetup {
         });
     }
 
-    // Проверка существующей конфигурации
+    /**
+     * Check existing configuration
+     * @param {string} language - Current language
+     * @returns {Promise<Object>} Configuration object
+     */
     async checkExistingConfig(language) {
-        const t = TRANSLATIONS[language];
-        const config = this.configManager.loadConfig();
+        const translations = TRANSLATIONS[language];
+        const config = await this.configManager.loadConfig();
         
         if (config.delay !== undefined) {
-            console.log(COLORS.info(`${t.currentDelay} ${config.delay}ms`));
+            console.log(COLORS.info(`${translations.currentDelay} ${config.delay}ms`));
             
             const rl = readline.createInterface({
                 input: process.stdin,
@@ -443,7 +832,7 @@ class AppSetup {
             });
 
             return new Promise((resolve) => {
-                rl.question(`${t.changeDelay} `, (answer) => {
+                rl.question(`${translations.changeDelay} `, (answer) => {
                     rl.close();
                     const choice = answer.trim().toLowerCase();
                     
@@ -459,31 +848,52 @@ class AppSetup {
         }
     }
 
-    // Получение перевода
-    getTranslation(key) {
-        return TRANSLATIONS.ru[key] || key;
-    }
-
-    // Инициализация приложения
+    /**
+     * Initialize application
+     * @returns {Promise<Object>} Initialized configuration
+     */
     async initialize() {
-        console.log(COLORS.info(this.getTranslation('title')));
-        console.log(COLORS.info(this.getTranslation('separator')));
-        console.log(COLORS.info(this.getTranslation('welcome')));
+        console.log(COLORS.info(TRANSLATIONS.ru.title));
+        console.log(COLORS.info(TRANSLATIONS.ru.separator));
+        console.log(COLORS.info(TRANSLATIONS.ru.welcome));
         console.log('');
 
         const language = await this.selectLanguage();
         const delay = await this.checkExistingConfig(language);
 
         const config = { language, delay };
-        if (this.configManager.saveConfig(config)) {
-            console.log(COLORS.success(this.getTranslation('configSaved')));
+        if (await this.configManager.saveConfig(config)) {
+            console.log(COLORS.success(TRANSLATIONS.ru.configSaved));
         }
 
         return { language, delay };
     }
 }
 
-// Основная функция
+// ============================================================================
+// GLOBAL ERROR HANDLERS
+// ============================================================================
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(COLORS.error('Unhandled Promise Rejection:'));
+    console.error(COLORS.error(reason));
+    errorHandler.handleError(reason instanceof Error ? reason : new Error(String(reason)), 'unhandledRejection');
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error(COLORS.error('Uncaught Exception:'));
+    errorHandler.handleError(error, 'uncaughtException');
+});
+
+// ============================================================================
+// MAIN APPLICATION
+// ============================================================================
+
+/**
+ * Main application function
+ */
 async function main() {
     try {
         const appSetup = new AppSetup();
@@ -493,24 +903,46 @@ async function main() {
         const links = await inputHandler.getLinks();
 
         if (links.length > 0) {
-            const downloader = new DatanodesDownloader(language, delay);
-            await downloader.processLinks(links);
+            const config = { delay, maxRetries: CONFIG.MAX_RETRIES, requestTimeout: CONFIG.REQUEST_TIMEOUT };
+            const downloadManager = new DownloadManager(config, language);
+            await downloadManager.processLinks(links);
         } else {
             console.log(COLORS.warn(TRANSLATIONS[language].noLinksEntered));
         }
 
     } catch (error) {
-        console.error(COLORS.error(`${TRANSLATIONS.ru.criticalError} ${error.message}`));
+        await errorHandler.handleError(error, 'main');
         process.exit(1);
     }
 }
 
-// Запуск программы
+// ============================================================================
+// MODULE EXPORTS
+// ============================================================================
+
+module.exports = {
+    DownloadManager,
+    UserInputHandler,
+    ConfigManager,
+    AppSetup,
+    LinkProcessor,
+    HttpClient,
+    ErrorHandler,
+    AppError,
+    ConfigurationError,
+    NetworkError,
+    LinkParsingError,
+    CONFIG,
+    TRANSLATIONS
+};
+
+// ============================================================================
+// APPLICATION ENTRY POINT
+// ============================================================================
+
 if (require.main === module) {
-    main().catch(error => {
-        console.error(COLORS.error(`${TRANSLATIONS.ru.unexpectedError} ${error.message}`));
+    main().catch(async (error) => {
+        await errorHandler.handleError(error, 'entry');
         process.exit(1);
     });
 }
-
-module.exports = { DatanodesDownloader, UserInputHandler, ConfigManager, AppSetup };
