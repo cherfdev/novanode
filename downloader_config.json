@@ -1,4 +1,6 @@
 {
-  "language": "ru",
-  "delay": 100
+  "language": "en",
+  "delay": 100,
+  "maxRetries": 3,
+  "requestTimeout": 30000
 }

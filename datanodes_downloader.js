@@ -500,7 +500,7 @@ class LinkProcessor {
             referer: CONFIG.BASE_URL,
             method_free: 'Free Download >>',
             method_premium: '',
-            __dl: 1
+            g_captch__a: 1
         };
 
         return this.httpClient.request(CONFIG.BASE_URL, {
