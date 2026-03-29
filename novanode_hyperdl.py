@@ -40,6 +40,7 @@ STATUS_DOWNLOADING = "downloading"
 STATUS_PAUSED = "paused"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
+STATUS_CANCELED = "canceled"
 
 
 class PauseSignal(Exception):
@@ -47,6 +48,10 @@ class PauseSignal(Exception):
 
 
 class StopSignal(Exception):
+    pass
+
+
+class CancelSignal(Exception):
     pass
 
 
@@ -83,6 +88,7 @@ class QueueItem:
     error: str = ""
     output_name: str = ""
     updated_at: str = ""
+    cancel_requested: bool = False
 
     def touch(self) -> None:
         self.updated_at = datetime.utcnow().isoformat()
@@ -509,12 +515,19 @@ class SequentialDownloadEngine:
         for item in self.items:
             if self.stop_event.is_set():
                 break
-            if item.status == STATUS_COMPLETED:
+            if item.cancel_requested or item.status == STATUS_CANCELED:
+                item.status = STATUS_CANCELED
+                item.error = item.error or "Cancelled by user"
+                self.update_item(item)
+                continue
+            if item.status == STATUS_COMPLETED or item.status == STATUS_PAUSED:
                 continue
 
             while not self.stop_event.is_set():
                 try:
                     self._wait_if_paused()
+                    if item.cancel_requested:
+                        raise CancelSignal()
                     self._process_item(item)
                     break
                 except PauseSignal:
@@ -522,6 +535,12 @@ class SequentialDownloadEngine:
                     self.update_item(item)
                     self.log(f"Paused: {item.source_link}", "warn")
                     continue
+                except CancelSignal:
+                    item.status = STATUS_CANCELED
+                    item.error = "Cancelled by user"
+                    self.update_item(item)
+                    self.log(f"Cancelled: {item.source_link}", "warn")
+                    break
                 except StopSignal:
                     item.status = STATUS_PAUSED
                     self.update_item(item)
@@ -542,6 +561,8 @@ class SequentialDownloadEngine:
             raise StopSignal()
 
     def _process_item(self, item: QueueItem) -> None:
+        if item.cancel_requested:
+            raise CancelSignal()
         item.error = ""
         item.speed_bps = 0.0
 
@@ -558,6 +579,8 @@ class SequentialDownloadEngine:
                 raise StopSignal()
             if self.pause_event.is_set():
                 raise PauseSignal()
+            if item.cancel_requested:
+                raise CancelSignal()
             try:
                 resolved = self.resolver.resolve(item.source_link)
                 item.file_id = resolved.file_id
@@ -597,6 +620,8 @@ class SequentialDownloadEngine:
                 raise StopSignal()
             if self.pause_event.is_set():
                 raise PauseSignal()
+            if item.cancel_requested:
+                raise CancelSignal()
 
             try:
                 self._download_stream(item, target_path, part_path)
@@ -613,6 +638,8 @@ class SequentialDownloadEngine:
                 self.log(f"Refreshing expired direct link for {filename}", "warn")
                 self._resolve_direct_link(item)
             except PauseSignal:
+                raise
+            except CancelSignal:
                 raise
             except StopSignal:
                 raise
@@ -679,6 +706,8 @@ class SequentialDownloadEngine:
 
         with part_path.open(mode) as handle:
             for chunk in response.iter_content(chunk_size=chunk_size):
+                if item.cancel_requested:
+                    raise CancelSignal()
                 if self.stop_event.is_set():
                     raise StopSignal()
                 if self.pause_event.is_set():
@@ -728,9 +757,20 @@ class SequentialDownloadEngine:
 
 
 class QueueRow:
-    def __init__(self, parent: tk.Widget, item: QueueItem, colors: dict[str, str]) -> None:
+    def __init__(
+        self,
+        parent: tk.Widget,
+        item: QueueItem,
+        colors: dict[str, str],
+        on_pause: callable,
+        on_resume: callable,
+        on_cancel: callable,
+    ) -> None:
         self.item_id = item.item_id
         self.colors = colors
+        self.on_pause = on_pause
+        self.on_resume = on_resume
+        self.on_cancel = on_cancel
 
         self.frame = tk.Frame(parent, bg=colors["card"], highlightthickness=1, highlightbackground=colors["line"])
         self.frame.pack(fill="x", padx=8, pady=5)
@@ -771,6 +811,18 @@ class QueueRow:
         self.progress = ttk.Progressbar(self.bottom, mode="determinate", maximum=100)
         self.progress.pack(side="left", fill="x", expand=True)
 
+        self.actions = tk.Frame(self.bottom, bg=colors["card"])
+        self.actions.pack(side="right", padx=(8, 0))
+
+        self.pause_btn = ttk.Button(self.actions, text="Pause", style="Ghost.TButton", width=7, command=self._pause)
+        self.pause_btn.pack(side="left")
+
+        self.resume_btn = ttk.Button(self.actions, text="Resume", style="Primary.TButton", width=7, command=self._resume)
+        self.resume_btn.pack(side="left", padx=(6, 0))
+
+        self.cancel_btn = ttk.Button(self.actions, text="Cancel", style="Danger.TButton", width=7, command=self._cancel)
+        self.cancel_btn.pack(side="left", padx=(6, 0))
+
         self.percent_label = tk.Label(
             self.bottom,
             textvariable=self.percent_var,
@@ -794,6 +846,18 @@ class QueueRow:
 
         self.update(item)
 
+    def _pause(self) -> None:
+        if self.on_pause:
+            self.on_pause(self.item_id)
+
+    def _resume(self) -> None:
+        if self.on_resume:
+            self.on_resume(self.item_id)
+
+    def _cancel(self) -> None:
+        if self.on_cancel:
+            self.on_cancel(self.item_id)
+
     def update(self, item: QueueItem) -> None:
         provider = item.provider.upper() if item.provider else "AUTO"
         self.source_var.set(f"[{provider}] {item.source_link}")
@@ -809,8 +873,11 @@ class QueueRow:
             STATUS_PAUSED: self.colors["chip_paused"],
             STATUS_COMPLETED: self.colors["chip_success"],
             STATUS_FAILED: self.colors["chip_error"],
+            STATUS_CANCELED: self.colors["chip_error"],
         }.get(item.status, self.colors["chip_pending"])
         self.status_chip.configure(bg=status_color)
+
+        self._update_buttons(item.status)
 
         extra = ""
         if item.speed_bps > 0 and item.status == STATUS_DOWNLOADING:
@@ -819,6 +886,24 @@ class QueueRow:
             extra = f" | ERR: {item.error}"
 
         self.meta_var.set(f"{format_bytes(item.downloaded)} / {format_bytes(item.total)}{extra}")
+
+    def _update_buttons(self, status: str) -> None:
+        can_pause = status in {STATUS_DOWNLOADING, STATUS_RESOLVING, STATUS_READY}
+        can_resume = status in {STATUS_PAUSED, STATUS_FAILED}
+        can_cancel = status in {
+            STATUS_PENDING,
+            STATUS_RESOLVING,
+            STATUS_READY,
+            STATUS_DOWNLOADING,
+            STATUS_PAUSED,
+            STATUS_FAILED,
+        }
+        if status in {STATUS_COMPLETED, STATUS_CANCELED}:
+            can_cancel = False
+
+        self.pause_btn.configure(state="normal" if can_pause else "disabled")
+        self.resume_btn.configure(state="normal" if can_resume else "disabled")
+        self.cancel_btn.configure(state="normal" if can_cancel else "disabled")
 
 
 def format_bytes(value: int) -> str:
@@ -933,6 +1018,7 @@ class NovaNodeApp(tk.Tk):
 
         self.items: list[QueueItem] = []
         self.rows: dict[str, QueueRow] = {}
+        self.current_item_id: str | None = None
 
         self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.pause_event = threading.Event()
@@ -1426,7 +1512,14 @@ class NovaNodeApp(tk.Tk):
             self._log(f"Skipped {invalid} invalid link(s).", "warn")
 
     def _add_row(self, item: QueueItem) -> None:
-        row = QueueRow(self.queue_inner, item, self.colors)
+        row = QueueRow(
+            self.queue_inner,
+            item,
+            self.colors,
+            on_pause=self._pause_item,
+            on_resume=self._resume_item,
+            on_cancel=self._cancel_item,
+        )
         self.rows[item.item_id] = row
 
     def _clear_rows(self) -> None:
@@ -1446,6 +1539,69 @@ class NovaNodeApp(tk.Tk):
             if item.item_id == item_id:
                 return item
         return None
+
+    def _pause_item(self, item_id: str) -> None:
+        item = self._find_item(item_id)
+        if not item:
+            return
+        if item.status in {STATUS_COMPLETED, STATUS_CANCELED}:
+            return
+
+        if item_id == self.current_item_id:
+            self.pause_event.set()
+            self.status_var.set("Pausing current item...")
+            self._log(f"Pause requested for {item.file_name or item.source_link}", "warn")
+            return
+
+        item.status = STATUS_PAUSED
+        self._sync_row(item)
+        self._refresh_summary()
+        if self.auto_save_var.get():
+            self._save_session(silent=True)
+
+    def _resume_item(self, item_id: str) -> None:
+        item = self._find_item(item_id)
+        if not item:
+            return
+        if item.status == STATUS_COMPLETED:
+            return
+
+        item.cancel_requested = False
+        if item.status in {STATUS_PAUSED, STATUS_FAILED, STATUS_CANCELED}:
+            item.status = STATUS_PENDING
+            item.error = ""
+            self._sync_row(item)
+            self._refresh_summary()
+            if self.auto_save_var.get():
+                self._save_session(silent=True)
+
+        if item_id == self.current_item_id and self.pause_event.is_set():
+            self.pause_event.clear()
+            self.status_var.set("Resuming current item...")
+            self._log(f"Resume requested for {item.file_name or item.source_link}", "info")
+            return
+
+        if not self.worker_thread or not self.worker_thread.is_alive():
+            self._start_queue()
+
+    def _cancel_item(self, item_id: str) -> None:
+        item = self._find_item(item_id)
+        if not item:
+            return
+        if item.status in {STATUS_COMPLETED, STATUS_CANCELED}:
+            return
+
+        item.cancel_requested = True
+        if item_id != self.current_item_id:
+            item.status = STATUS_CANCELED
+            item.error = "Cancelled by user"
+            self._sync_row(item)
+            self._refresh_summary()
+            if self.auto_save_var.get():
+                self._save_session(silent=True)
+            return
+
+        self._log(f"Cancel requested for {item.file_name or item.source_link}", "warn")
 
     def _start_queue(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -1692,8 +1848,19 @@ class NovaNodeApp(tk.Tk):
                     item.speed_bps = float(payload.get("speed_bps", item.speed_bps))
                     item.error = str(payload.get("error", item.error))
                     item.output_name = str(payload.get("output_name", item.output_name))
+                    item.cancel_requested = bool(payload.get("cancel_requested", item.cancel_requested))
                     item.updated_at = str(payload.get("updated_at", item.updated_at))
                     self._sync_row(item)
+
+                    if item.status in {STATUS_DOWNLOADING, STATUS_RESOLVING, STATUS_READY}:
+                        self.current_item_id = item_id
+                    elif self.current_item_id == item_id and item.status in {
+                        STATUS_COMPLETED,
+                        STATUS_FAILED,
+                        STATUS_PAUSED,
+                        STATUS_CANCELED,
+                    }:
+                        self.current_item_id = None
 
                 self._refresh_summary()
                 self._update_global_progress()
@@ -1721,7 +1888,7 @@ class NovaNodeApp(tk.Tk):
     def _refresh_summary(self) -> None:
         total = len(self.items)
         completed = sum(1 for item in self.items if item.status == STATUS_COMPLETED)
-        failed = sum(1 for item in self.items if item.status == STATUS_FAILED)
+        failed = sum(1 for item in self.items if item.status in {STATUS_FAILED, STATUS_CANCELED})
         active = sum(
             1 for item in self.items if item.status in {STATUS_DOWNLOADING, STATUS_RESOLVING, STATUS_READY}
         )
