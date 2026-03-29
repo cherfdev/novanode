@@ -62,6 +62,9 @@ class AppSettings:
     chunk_kb: int = 512
     auto_save_session: bool = True
     gofile_token: str = ""
+    create_project_subfolder: bool = False
+    project_folder_name: str = ""
+    auto_resume_on_startup: bool = True
 
 
 @dataclass
@@ -920,6 +923,10 @@ class NovaNodeApp(tk.Tk):
         self.chunk_kb_var = tk.IntVar(value=self.settings.chunk_kb)
         self.auto_save_var = tk.BooleanVar(value=True)
         self.gofile_token_var = tk.StringVar(value="")
+        self.create_subfolder_var = tk.BooleanVar(value=False)
+        self.project_folder_var = tk.StringVar(value="")
+        self.auto_resume_var = tk.BooleanVar(value=True)
+        self.active_output_dir = str(DEFAULT_OUTPUT_DIR)
 
         self.status_var = tk.StringVar(value="Ready")
         self.summary_var = tk.StringVar(value="Queue: 0 | Completed: 0 | Failed: 0 | Active: 0")
@@ -940,7 +947,11 @@ class NovaNodeApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if SESSION_FILE.exists():
-            self._log("Previous session file detected. Use Restore Session to continue later.", "warn")
+            if self.auto_resume_var.get():
+                self._log("Previous session detected. Auto-restore is enabled.", "info")
+                self.after(600, self._auto_restore_and_resume)
+            else:
+                self._log("Previous session file detected. Use Restore Session to continue later.", "warn")
 
     def _build_styles(self) -> None:
         style = ttk.Style(self)
@@ -1042,9 +1053,18 @@ class NovaNodeApp(tk.Tk):
         top_controls.pack(fill="x", padx=12, pady=(10, 6))
 
         tk.Label(top_controls, text="Output folder", bg=self.colors["panel"], fg=self.colors["muted"], font=("Segoe UI", 9)).pack(side="left")
-        output_entry = ttk.Entry(top_controls, textvariable=self.output_dir_var, width=70)
+        output_entry = ttk.Entry(top_controls, textvariable=self.output_dir_var, width=56)
         output_entry.pack(side="left", padx=(8, 6))
         ttk.Button(top_controls, text="Browse", style="Ghost.TButton", command=self._pick_output_dir).pack(side="left")
+
+        tk.Label(
+            top_controls,
+            text="Project folder",
+            bg=self.colors["panel"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(14, 6))
+        ttk.Entry(top_controls, textvariable=self.project_folder_var, width=24).pack(side="left")
 
         ttk.Button(top_controls, text="Save Session", style="Ghost.TButton", command=self._save_session).pack(side="right")
         ttk.Button(top_controls, text="Restore Session", style="Ghost.TButton", command=self._restore_session).pack(
@@ -1071,6 +1091,18 @@ class NovaNodeApp(tk.Tk):
 
         auto_save = ttk.Checkbutton(settings, text="Auto-save session", variable=self.auto_save_var)
         auto_save.grid(row=0, column=10, padx=(4, 0), sticky="w")
+        create_subfolder = ttk.Checkbutton(
+            settings,
+            text="Create project subfolder",
+            variable=self.create_subfolder_var,
+        )
+        create_subfolder.grid(row=0, column=11, padx=(12, 0), sticky="w")
+        auto_resume = ttk.Checkbutton(
+            settings,
+            text="Auto resume on startup",
+            variable=self.auto_resume_var,
+        )
+        auto_resume.grid(row=0, column=12, padx=(12, 0), sticky="w")
 
         main = tk.Frame(root, bg=self.colors["bg"])
         main.pack(fill="both", expand=True)
@@ -1211,6 +1243,31 @@ class NovaNodeApp(tk.Tk):
     def _on_queue_canvas_configure(self, event: tk.Event) -> None:
         self.queue_canvas.itemconfigure(self.queue_window, width=event.width)
 
+    def _compute_effective_output_dir(self, settings: AppSettings) -> Path:
+        base = Path(self.output_dir_var.get()).expanduser()
+        if settings.create_project_subfolder:
+            raw_name = settings.project_folder_name.strip()
+            if not raw_name:
+                raw_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+            return base / sanitize_file_name(raw_name)
+        return base
+
+    def _auto_restore_and_resume(self) -> None:
+        if not SESSION_FILE.exists() or not self.auto_resume_var.get():
+            return
+
+        restored = self._restore_session(silent=True)
+        if not restored:
+            return
+
+        resumable = any(
+            item.status in {STATUS_PENDING, STATUS_PAUSED, STATUS_FAILED, STATUS_READY, STATUS_RESOLVING}
+            for item in self.items
+        )
+        if resumable:
+            self._log("Auto-resume: restarting previous session queue.", "info")
+            self._start_queue()
+
     def _load_settings(self) -> None:
         if not SETTINGS_FILE.exists():
             return
@@ -1227,6 +1284,9 @@ class NovaNodeApp(tk.Tk):
         self.chunk_kb_var.set(int(data.get("chunk_kb", self.chunk_kb_var.get())))
         self.auto_save_var.set(bool(data.get("auto_save_session", True)))
         self.gofile_token_var.set(str(data.get("gofile_token", "")))
+        self.create_subfolder_var.set(bool(data.get("create_project_subfolder", False)))
+        self.project_folder_var.set(str(data.get("project_folder_name", "")))
+        self.auto_resume_var.set(bool(data.get("auto_resume_on_startup", True)))
         self.output_dir_var.set(str(data.get("output_dir", self.output_dir_var.get())))
 
     def _save_settings(self) -> None:
@@ -1237,6 +1297,9 @@ class NovaNodeApp(tk.Tk):
             "chunk_kb": self.chunk_kb_var.get(),
             "auto_save_session": self.auto_save_var.get(),
             "gofile_token": self.gofile_token_var.get().strip(),
+            "create_project_subfolder": self.create_subfolder_var.get(),
+            "project_folder_name": self.project_folder_var.get().strip(),
+            "auto_resume_on_startup": self.auto_resume_var.get(),
             "output_dir": self.output_dir_var.get(),
         }
         try:
@@ -1253,6 +1316,9 @@ class NovaNodeApp(tk.Tk):
                 chunk_kb=int(self.chunk_kb_var.get()),
                 auto_save_session=bool(self.auto_save_var.get()),
                 gofile_token=self.gofile_token_var.get().strip(),
+                create_project_subfolder=bool(self.create_subfolder_var.get()),
+                project_folder_name=self.project_folder_var.get().strip(),
+                auto_resume_on_startup=bool(self.auto_resume_var.get()),
             )
         except (TypeError, ValueError):
             messagebox.showerror("Invalid settings", "One or more setting values are invalid.")
@@ -1393,12 +1459,13 @@ class NovaNodeApp(tk.Tk):
         if not settings:
             return
 
-        output_dir = Path(self.output_dir_var.get()).expanduser()
+        output_dir = self._compute_effective_output_dir(settings)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             messagebox.showerror("Output error", f"Cannot access output folder:\n{exc}")
             return
+        self.active_output_dir = str(output_dir)
 
         self.stop_event.clear()
         self.pause_event.clear()
@@ -1427,7 +1494,7 @@ class NovaNodeApp(tk.Tk):
         self.pause_btn.configure(state="normal")
         self.stop_btn.configure(state="normal")
         self.status_var.set("Running queue...")
-        self._log("Queue started.", "info")
+        self._log(f"Queue started. Output: {self.active_output_dir}", "info")
 
     def _pause_queue(self) -> None:
         if not self.worker_thread or not self.worker_thread.is_alive():
@@ -1493,6 +1560,7 @@ class NovaNodeApp(tk.Tk):
             "app_name": APP_NAME,
             "saved_at": datetime.utcnow().isoformat(),
             "output_dir": self.output_dir_var.get(),
+            "active_output_dir": self.active_output_dir,
             "settings": {
                 "timeout_seconds": self.timeout_var.get(),
                 "resolve_retries": self.resolve_retries_var.get(),
@@ -1500,6 +1568,9 @@ class NovaNodeApp(tk.Tk):
                 "chunk_kb": self.chunk_kb_var.get(),
                 "auto_save_session": self.auto_save_var.get(),
                 "gofile_token": self.gofile_token_var.get().strip(),
+                "create_project_subfolder": self.create_subfolder_var.get(),
+                "project_folder_name": self.project_folder_var.get().strip(),
+                "auto_resume_on_startup": self.auto_resume_var.get(),
             },
             "items": [asdict(item) for item in self.items],
         }
@@ -1512,16 +1583,20 @@ class NovaNodeApp(tk.Tk):
             if not silent:
                 self._log(f"Could not save session: {exc}", "error")
 
-    def _restore_session(self) -> None:
+    def _restore_session(self, silent: bool = False) -> bool:
         if not SESSION_FILE.exists():
-            messagebox.showwarning("No session", "No saved session file found.")
-            return
+            if not silent:
+                messagebox.showwarning("No session", "No saved session file found.")
+            return False
 
         try:
             data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            messagebox.showerror("Session error", f"Cannot read session:\n{exc}")
-            return
+            if not silent:
+                messagebox.showerror("Session error", f"Cannot read session:\n{exc}")
+            else:
+                self._log(f"Auto-restore failed: {exc}", "error")
+            return False
 
         self.items.clear()
         self._clear_rows()
@@ -1533,10 +1608,16 @@ class NovaNodeApp(tk.Tk):
         self.chunk_kb_var.set(int(settings.get("chunk_kb", self.chunk_kb_var.get())))
         self.auto_save_var.set(bool(settings.get("auto_save_session", self.auto_save_var.get())))
         self.gofile_token_var.set(str(settings.get("gofile_token", self.gofile_token_var.get())))
+        self.create_subfolder_var.set(bool(settings.get("create_project_subfolder", self.create_subfolder_var.get())))
+        self.project_folder_var.set(str(settings.get("project_folder_name", self.project_folder_var.get())))
+        self.auto_resume_var.set(bool(settings.get("auto_resume_on_startup", self.auto_resume_var.get())))
 
         self.output_dir_var.set(str(data.get("output_dir", self.output_dir_var.get())))
+        self.active_output_dir = str(data.get("active_output_dir", self.output_dir_var.get()))
 
         loaded = 0
+        active_dir = Path(self.active_output_dir).expanduser()
+        output_base_dir = Path(self.output_dir_var.get()).expanduser()
         for row in data.get("items", []):
             try:
                 item = QueueItem(**row)
@@ -1546,7 +1627,11 @@ class NovaNodeApp(tk.Tk):
             if item.status in {STATUS_DOWNLOADING, STATUS_RESOLVING, STATUS_READY}:
                 item.status = STATUS_PAUSED
 
-            output_path = Path(self.output_dir_var.get()).expanduser() / (item.output_name or sanitize_file_name(item.file_name))
+            target_name = item.output_name or sanitize_file_name(item.file_name)
+            output_path = active_dir / target_name
+            fallback_output_path = output_base_dir / target_name
+            if not output_path.exists() and fallback_output_path.exists():
+                output_path = fallback_output_path
             part_path = output_path.with_suffix(output_path.suffix + ".part")
 
             if item.status == STATUS_COMPLETED and not output_path.exists():
@@ -1570,7 +1655,15 @@ class NovaNodeApp(tk.Tk):
 
         self._refresh_summary()
         self._update_global_progress()
-        self._log(f"Session restored: {loaded} item(s).", "success")
+        if loaded == 0:
+            self.status_var.set("Ready")
+            if not silent:
+                self._log("Session restored, but no valid items were found.", "warn")
+            return False
+
+        self.status_var.set("Session restored")
+        self._log(f"Session restored: {loaded} item(s). Output: {self.active_output_dir}", "success")
+        return True
 
     def _drain_events(self) -> None:
         while True:
