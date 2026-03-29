@@ -1,0 +1,29 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="64" y1="64" x2="448" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0E1F35"/>
+      <stop offset="1" stop-color="#06111D"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="120" y1="96" x2="394" y2="416" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#26C4FF"/>
+      <stop offset="1" stop-color="#35E0A1"/>
+    </linearGradient>
+    <filter id="glow" x="80" y="80" width="352" height="352" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="url(#bg)"/>
+  <rect x="24" y="24" width="464" height="464" rx="96" stroke="#1E3A5A" stroke-width="8"/>
+
+  <g filter="url(#glow)">
+    <path d="M128 366V146H180L286 298V146H338V366H286L180 214V366H128Z" fill="url(#accent)"/>
+    <path d="M384 214V312H348V214H320L366 164L412 214H384Z" fill="url(#accent)"/>
+  </g>
+
+  <circle cx="408" cy="108" r="14" fill="#35E0A1"/>
+</svg>

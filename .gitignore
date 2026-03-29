@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+novanode_session.json
+novanode_settings.json
+downloader_gui_config.json
